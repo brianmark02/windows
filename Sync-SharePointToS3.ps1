@@ -87,7 +87,12 @@ try {
     # Initialize AWS
     Write-Host "Initializing AWS..." -NoNewline
     if (-not [string]::IsNullOrWhiteSpace($AwsAccessKey)) {
-        Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
+        if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
+            Set-AWSCredential -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -StoreAs default -Force
+            Set-DefaultAWSRegion -Region $AwsRegion
+        } else {
+            Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
+        }
     }
 
     # Verify S3 Access
@@ -679,7 +684,15 @@ try {
 
                 # Capture variables for use in the parallel scope
                 $currentLibTitle = $lib.Title
-                $primaryConnection = Get-PnPConnection
+
+                # Extract access token securely from the main thread so we can inject it into runspaces
+                $accessToken = $null
+                try {
+                    # Get-PnPAccessToken is the standard supported cmdlet in modern PnP versions
+                    $accessToken = Get-PnPAccessToken -Connection $siteConnection -ErrorAction Stop
+                } catch {
+                    Write-Warning "Failed to retrieve Access Token. Parallel thread connections may fail."
+                }
 
                 $syncedResults = $filesToSync | ForEach-Object -Parallel {
                     $plan = $_
@@ -695,21 +708,34 @@ try {
                     $AwsAccessKey = $using:AwsAccessKey
                     $AwsSecretKey = $using:AwsSecretKey
                     $AwsRegion = $using:AwsRegion
-                    $primaryConnection = $using:primaryConnection
+                    $accessToken = $using:accessToken
 
-                    # Setup AWS and PnP contexts inside the parallel runspace
+                    # Force module load inside the runspace
+                    Import-Module PnP.PowerShell -ErrorAction SilentlyContinue
+
+                    # Setup AWS parameters explicitly (bypasses runspace default config issues)
+                    $awsParams = @{
+                        BucketName  = $S3BucketName
+                        ErrorAction = 'Stop'
+                    }
                     if (-not [string]::IsNullOrWhiteSpace($AwsAccessKey)) {
-                        Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
+                        $awsParams.AccessKey = $AwsAccessKey
+                        $awsParams.SecretKey = $AwsSecretKey
+                        $awsParams.Region    = $AwsRegion
                     }
 
-                    # Clone the PnP connection to ensure thread safety without prompting for login
+                    # Reconnect locally within the thread using the captured Bearer token
+                    # This ensures 100% thread safety without needing the missing Clone-PnPConnection cmdlet
                     $threadConnection = $null
-                    if ($null -ne $primaryConnection) {
+                    if (-not [string]::IsNullOrWhiteSpace($accessToken)) {
                         try {
-                            $threadConnection = Clone-PnPConnection -Connection $primaryConnection
+                            $secureToken = ConvertTo-SecureString $accessToken -AsPlainText -Force
+                            $threadConnection = Connect-PnPOnline -Url $url -ReturnConnection -ErrorAction Stop -WarningAction SilentlyContinue -AccessToken $secureToken
                         } catch {
-                            Write-Warning "Failed to clone PnP Connection in thread: $($_.Exception.Message)"
+                            Write-Warning "Failed to setup thread connection: $($_.Exception.Message)"
                         }
+                    } else {
+                        Write-Warning "No Access Token found. Downloading in parallel may fail with Unauthorized."
                     }
 
                     # --- FOLDER LOGIC ---
@@ -717,7 +743,11 @@ try {
                         try {
                             Write-Host "Creating Folder: $s3Key" -NoNewline
                             $emptyTmp = [System.IO.Path]::GetTempFileName()
-                            Write-S3Object -BucketName $S3BucketName -Key $s3Key -File $emptyTmp -ErrorAction Stop
+
+                            $folderAwsParams = $awsParams.Clone()
+                            $folderAwsParams.Key = $s3Key
+                            $folderAwsParams.File = $emptyTmp
+                            Write-S3Object @folderAwsParams
                             Remove-Item -LiteralPath $emptyTmp -Force
                             Write-Host " -> Created" -ForegroundColor Green
                             $plan.Status = "Created"
@@ -817,7 +847,10 @@ try {
                                 do {
                                     try {
                                         Write-Host "Uploading to S3 (Attempt $($uploadRetryCount + 1))..." -NoNewline
-                                        Write-S3Object -BucketName $S3BucketName -File $localTempFile -Key $s3Key -ErrorAction Stop
+                                        $fileAwsParams = $awsParams.Clone()
+                                        $fileAwsParams.Key = $s3Key
+                                        $fileAwsParams.File = $localTempFile
+                                        Write-S3Object @fileAwsParams
                                         Write-Host " -> Done" -ForegroundColor Green
                                         $uploaded = $true
                                         $finalStatus = "Synced ($action)"
