@@ -135,10 +135,11 @@ try {
             # Connect SharePoint (Hybrid Support) - Restored for PS 5.1 Compatibility
             Write-Host "Connecting to SharePoint..." -NoNewline
 
+            $siteConnection = $null
             if ($PSVersionTable.PSVersion.Major -lt 7) {
                 # PowerShell 5.1 (Legacy) - Use WebLogin (Bypasses Modern App Blocks)
                 try {
-                    Connect-PnPOnline -Url $url -UseWebLogin -ErrorAction Stop
+                    $siteConnection = Connect-PnPOnline -Url $url -UseWebLogin -ReturnConnection -ErrorAction Stop
                     Write-Host " Connected (WebLogin - Legacy)" -ForegroundColor Green
                 }
                 catch {
@@ -148,29 +149,28 @@ try {
             }
             else {
                 # PowerShell 7+ (Modern)
-                # Default to "Azure PowerShell" App ID (Public Client)
+                # Default to "PnP Management Shell" App ID (Public Client)
                 if ([string]::IsNullOrWhiteSpace($clientId) -or -not ($clientId -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')) {
-                    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"
+                    $clientId = "31359c7f-f9e5-400f-8d19-b1a1176b50e6"
                 }
 
                 try {
-                    Write-Host "`n[AUTH] Starting Device Login (Azure PowerShell App)..." -ForegroundColor Yellow
-                    Write-Host "[AUTH] Please watch the console for a CODE and URL." -ForegroundColor Yellow
+                    Write-Host "`n[AUTH] Starting Interactive Login..." -ForegroundColor Yellow
 
                     # For fully automated setups, consider using:
                     # Connect-PnPOnline -Url $url -ClientId $clientId -Thumbprint $certThumbprint -Tenant $tenantId
-                    Connect-PnPOnline -Url $url -DeviceLogin -ClientId $clientId -ErrorAction Stop
-                    Write-Host " Connected (DeviceLogin)" -ForegroundColor Green
+                    $siteConnection = Connect-PnPOnline -Url $url -Interactive -ClientId $clientId -ReturnConnection -ErrorAction Stop
+                    Write-Host " Connected (Interactive)" -ForegroundColor Green
                 }
                 catch {
                     Write-Error "`nFAILED: $($_.Exception.Message)"
-                    Write-Warning "Authentication Failed using 'Azure PowerShell' ID."
+                    Write-Warning "Authentication Failed using 'Interactive' Login."
                     Write-Warning "If this fails, please switch to Windows PowerShell 5.1."
                     throw $_
                 }
             }
 
-            $web = Get-PnPWeb
+            $web = Get-PnPWeb -Connection $siteConnection
             $siteName = $web.Title
             # Sanitize: Remove invalid chars AND trim dots/spaces from start/end
             $siteFolderName = ($siteName -replace '[\\/:*?"<>|]', '').Trim(' .')
@@ -179,7 +179,7 @@ try {
 
             # Get ALL Document and Page Libraries
             Write-Host "Gathering all valid Document and Page Libraries..." -ForegroundColor Yellow
-            $availableLibs = Get-PnPList | Where-Object {
+            $availableLibs = Get-PnPList -Connection $siteConnection | Where-Object {
                 $_.BaseType -eq 1 -and
                 $_.Hidden -eq $false -and
                 $_.Title -notmatch '(?i)^(AppPackages|Apps for SharePoint|Client Side Assets|MicroFeed|ContentTypeSyncLog)$'
@@ -221,7 +221,7 @@ try {
 
                 # CAML Query: RecursiveAll (Traverse Folders)
                 $camlQuery = "<View Scope='RecursiveAll'><RowLimit Paged='TRUE'>1000</RowLimit></View>"
-                $items = Get-PnPListItem -List $lib -PageSize 1000 -Query $camlQuery -ErrorAction Stop
+                $items = Get-PnPListItem -List $lib -PageSize 1000 -Query $camlQuery -Connection $siteConnection -ErrorAction Stop
 
                 if (-not $items -or $items.Count -eq 0) {
                     Write-Host "No items found in $($lib.Title)." -ForegroundColor DarkGray
@@ -548,7 +548,7 @@ try {
 
                                         # Attempt 1: Standard PnP (REST)
                                         if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($fileName)) { throw "Filename contains PowerShell wildcard characters which breaks Get-PnPFile parameter binding (fallback to CSOM)" }
-                                        Get-PnPFile -Url $serverRelativeUrl -Path $TempDownloadPath -FileName $safeTempName -AsFile -Force -ErrorAction Stop
+                                        Get-PnPFile -Url $serverRelativeUrl -Path $TempDownloadPath -FileName $safeTempName -AsFile -Force -Connection $siteConnection -ErrorAction Stop
 
                                         Write-Progress -Activity "Downloading from SharePoint" -Completed
                                         $downloaded = $true
@@ -558,7 +558,7 @@ try {
                                         Write-Warning "`n -> Standard download failed ($($_.Exception.Message)). Switching to CSOM..."
                                         try {
                                             # Attempt 2: CSOM Fallback (ID-Based for robustness)
-                                            $ctx = Get-PnPContext
+                                        $ctx = Get-PnPContext -Connection $siteConnection
                                             $list = $ctx.Web.Lists.GetByTitle($lib.Title)
                                             $spItem = $list.GetItemById($item.Id)
                                             $fileObj = $spItem.File
