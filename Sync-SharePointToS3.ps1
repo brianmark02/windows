@@ -149,9 +149,9 @@ try {
             }
             else {
                 # PowerShell 7+ (Modern)
-                # Default to "PnP Management Shell" App ID (Public Client)
+                # Default to "Azure PowerShell" App ID (Public Client)
                 if ([string]::IsNullOrWhiteSpace($clientId) -or -not ($clientId -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')) {
-                    $clientId = "31359c7f-f9e5-400f-8d19-b1a1176b50e6"
+                    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"
                 }
 
                 try {
