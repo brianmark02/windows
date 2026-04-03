@@ -149,9 +149,9 @@ try {
             }
             else {
                 # PowerShell 7+ (Modern)
-                # Default to "Azure PowerShell" App ID (Public Client)
+                # Default to "SharePoint Online Management Shell" App ID (Public Client)
                 if ([string]::IsNullOrWhiteSpace($clientId) -or -not ($clientId -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')) {
-                    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"
+                    $clientId = "9bc3ab49-b65d-410a-85ad-de819febfddc"
                 }
 
                 try {
