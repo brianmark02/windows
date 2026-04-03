@@ -667,7 +667,7 @@ try {
                 $syncPlans = $null
             }
             # -----------------------------------------------------------------
-            # PHASE 3: Sequential Logic Completion (Only runs for PS 7)
+            # PHASE 3: Parallel Logic Completion (Only runs for PS 7)
             # -----------------------------------------------------------------
             if ($syncPlans) {
                 # Filter items that need action
@@ -677,12 +677,40 @@ try {
 
                 Write-Host "Analysis Complete. Unchanged: $unchangedCount. To Sync: $($filesToSync.Count)" -ForegroundColor Cyan
 
-                foreach ($plan in $filesToSync) {
+                # Capture variables for use in the parallel scope
+                $currentLibTitle = $lib.Title
+                $primaryConnection = Get-PnPConnection
+
+                $syncedResults = $filesToSync | ForEach-Object -Parallel {
+                    $plan = $_
                     $fileName = $plan.FileName
                     $serverRelativeUrl = $plan.SP_Path
                     $s3Key = $plan.S3_Path
                     $action = $plan.Action
                     $spFileSize = $plan.SP_RawSize
+                    $libTitle = $using:currentLibTitle
+                    $S3BucketName = $using:S3BucketName
+                    $TempDownloadPath = $using:TempDownloadPath
+                    $url = $using:url
+                    $AwsAccessKey = $using:AwsAccessKey
+                    $AwsSecretKey = $using:AwsSecretKey
+                    $AwsRegion = $using:AwsRegion
+                    $primaryConnection = $using:primaryConnection
+
+                    # Setup AWS and PnP contexts inside the parallel runspace
+                    if (-not [string]::IsNullOrWhiteSpace($AwsAccessKey)) {
+                        Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
+                    }
+
+                    # Clone the PnP connection to ensure thread safety without prompting for login
+                    $threadConnection = $null
+                    if ($null -ne $primaryConnection) {
+                        try {
+                            $threadConnection = Clone-PnPConnection -Connection $primaryConnection
+                        } catch {
+                            Write-Warning "Failed to clone PnP Connection in thread: $($_.Exception.Message)"
+                        }
+                    }
 
                     # --- FOLDER LOGIC ---
                     if ($action -eq "Create Folder") {
@@ -694,15 +722,13 @@ try {
                             Write-Host " -> Created" -ForegroundColor Green
                             $plan.Status = "Created"
                             $plan.S3_DateCopied = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                            $counters.Copied++
-                            continue
+                            return @{ Type = 'Copied'; Plan = $plan }
                         }
                         catch {
                             Write-Warning "Folder Create Failed: $_"
                             $plan.Status = "Folder Error"
                             $plan.Notes = "Err: $_"
-                            $counters.Errors++
-                            continue
+                            return @{ Type = 'Error'; Plan = $plan }
                         }
                     }
 
@@ -714,19 +740,18 @@ try {
                     $downloaded = $false
                     $finalStatus = $plan.Status
                     $finalNotes = $plan.Notes
+                    $returnType = 'Error'
 
                     try {
                         do {
                             try {
                                 try {
                                     # Download
-                                    Write-Progress -Activity "Downloading from SharePoint" -Status "File: $fileName ($([math]::Round($spFileSize/1MB, 2)) MB)" -PercentComplete -1
                                     Write-Host "Downloading ($action) [Attempt $($retryCount + 1)]: $fileName" -NoNewline
 
                                     if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($fileName)) { throw "Filename contains PowerShell wildcard characters which breaks Get-PnPFile parameter binding (fallback to CSOM)" }
-                                    Get-PnPFile -Url $serverRelativeUrl -Path $TempDownloadPath -FileName $safeTempName -AsFile -Force -ErrorAction Stop
+                                    Get-PnPFile -Url $serverRelativeUrl -Path $TempDownloadPath -FileName $safeTempName -AsFile -Force -ErrorAction Stop -Connection $threadConnection
 
-                                    Write-Progress -Activity "Downloading from SharePoint" -Completed
                                     $downloaded = $true
                                     Write-Host " -> Downloaded" -ForegroundColor Green
                                 }
@@ -734,8 +759,8 @@ try {
                                     Write-Warning "`n -> Standard download failed ($($_.Exception.Message)). Switching to CSOM..."
                                     try {
                                         # Attempt 2: CSOM Fallback (ID-Based for robustness)
-                                        $ctx = Get-PnPContext
-                                        $list = $ctx.Web.Lists.GetByTitle($lib.Title)
+                                        $ctx = Get-PnPContext -Connection $threadConnection
+                                        $list = $ctx.Web.Lists.GetByTitle($libTitle)
                                         $spItem = $list.GetItemById($plan.ItemId)
                                         $fileObj = $spItem.File
                                         $stream = $fileObj.OpenBinaryStream()
@@ -771,7 +796,6 @@ try {
                                     Write-Warning "`n -> File Blocked by SharePoint Virus Scanner: $errMsg"
                                     $finalStatus = "Blocked (Virus)"
                                     $finalNotes = "Err: Virus Scanner Block"
-                                    $counters.Errors++
                                     $retryCount = $maxRetries # Break loop immediately
                                 }
                                 elseif ($retryCount -lt $maxRetries) {
@@ -782,7 +806,6 @@ try {
                                     Write-Warning "`n -> Failed to download after $maxRetries attempts: $errMsg"
                                     $finalStatus = "Download Failed"
                                     $finalNotes = "Failed after $maxRetries attempts: $errMsg"
-                                    $counters.Errors++
                                 }
                             }
                         } while (-not $downloaded -and $retryCount -lt $maxRetries)
@@ -798,7 +821,7 @@ try {
                                         Write-Host " -> Done" -ForegroundColor Green
                                         $uploaded = $true
                                         $finalStatus = "Synced ($action)"
-                                        $counters.Copied++
+                                        $returnType = 'Copied'
                                         # Update S3 info in plan for report
                                         $plan.S3_Size = [math]::Round((Get-Item -LiteralPath $localTempFile).Length / 1MB, 2)
                                         $plan.S3_DateCopied = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
@@ -814,7 +837,6 @@ try {
                                             Write-Warning "`n -> Upload Failed after $maxRetries attempts: $upErrMsg"
                                             $finalStatus = "Upload Failed"
                                             $finalNotes = "Download OK, Upload Failed: $upErrMsg"
-                                            $counters.Errors++
                                         }
                                     }
                                 } while (-not $uploaded -and $uploadRetryCount -lt $maxRetries)
@@ -829,13 +851,28 @@ try {
                     # Update Plan with Final Status
                     $plan.Status = $finalStatus
                     $plan.Notes = $finalNotes
+
+                    return @{ Type = $returnType; Plan = $plan }
+                } -ThrottleLimit 5
+
+                # Tally results from parallel run and update the main syncPlans list
+                $finalPlans = @()
+                $finalPlans += ($syncPlans | Where-Object { $_.Action -eq "Skip" })
+
+                foreach ($res in @($syncedResults)) {
+                    if ($res.Type -eq 'Copied') { $counters.Copied++ }
+                    elseif ($res.Type -eq 'Error') { $counters.Errors++ }
+
+                    if ($null -ne $res.Plan) {
+                        $finalPlans += $res.Plan
+                    }
                 }
 
                 # -----------------------------------------------------------------
                 # PHASE 2: Batch Logging (I/O Optimization)
                 # -----------------------------------------------------------------
                 # Export all plans (Unchanged + Synced + Errors) together
-                $syncPlans | Select-Object SiteUrl, Site, SP_Path, SP_Size, SP_DateModified, S3_Path, S3_Size, S3_DateCopied, Status, Notes | Export-Csv -Path $ReportFilePath -NoTypeInformation -Append -Force
+                $finalPlans | Select-Object SiteUrl, Site, SP_Path, SP_Size, SP_DateModified, S3_Path, S3_Size, S3_DateCopied, Status, Notes | Export-Csv -Path $ReportFilePath -NoTypeInformation -Append -Force
 
                 # Cleanup Memory
                 [System.GC]::Collect()
