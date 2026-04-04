@@ -36,9 +36,9 @@ try {
     $AwsSecretKey = $config.AwsSecretKey.Trim()
     $AwsRegion = if ($config.AwsRegion) { $config.AwsRegion.Trim() } else { "ap-southeast-1" }
 
-    $AppId = if ($config.AppId) { $config.AppId.Trim() } elseif ($config.ClientId) { $config.ClientId.Trim() } else { $null }
-    $TenantId = if ($config.TenantId) { $config.TenantId.Trim() } elseif ($config.Tenant) { $config.Tenant.Trim() } else { $null }
-    $CertThumbprint = if ($config.CertThumbprint) { $config.CertThumbprint.Trim() } elseif ($config.Thumbprint) { $config.Thumbprint.Trim() } else { $null }
+    $AppId = if ($config.AppId) { $config.AppId.Trim() } else { $null }
+    $TenantId = if ($config.TenantId) { $config.TenantId.Trim() } else { $null }
+    $CertThumbprint = if ($config.CertThumbprint) { $config.CertThumbprint.Trim() } else { $null }
 
     # Load Site List
     $siteUrls = @()
