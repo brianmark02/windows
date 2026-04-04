@@ -84,20 +84,23 @@ if (-not (Get-Module -ListAvailable -Name AWSPowerShell) -and -not (Get-Module -
 # -----------------------------------------------------------------------------
 
 try {
-    # Initialize AWS
+    # Initialize AWS parameters for the main thread explicitly to avoid changing default config
     Write-Host "Initializing AWS..." -NoNewline
+    $awsGlobalParams = @{
+        BucketName  = $S3BucketName
+        ErrorAction = 'Stop'
+    }
     if (-not [string]::IsNullOrWhiteSpace($AwsAccessKey)) {
-        if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
-            Set-AWSCredential -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -StoreAs default -Force
-            Set-DefaultAWSRegion -Region $AwsRegion
-        } else {
-            Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
-        }
+        $awsGlobalParams.AccessKey = $AwsAccessKey
+        $awsGlobalParams.SecretKey = $AwsSecretKey
+        $awsGlobalParams.Region    = $AwsRegion
     }
 
     # Verify S3 Access
     try {
-        Get-S3Object -BucketName $S3BucketName -MaxKeys 1 -ErrorAction Stop | Select-Object -First 1 | Out-Null
+        $verifyParams = $awsGlobalParams.Clone()
+        $verifyParams.MaxKeys = 1
+        Get-S3Object @verifyParams | Select-Object -First 1 | Out-Null
         Write-Host " OK" -ForegroundColor Green
     }
     catch {
@@ -119,6 +122,10 @@ try {
         }
         Write-Host "Loaded $($processedSites.Count) processed sites." -ForegroundColor Gray
     }
+
+    # Global variables for caching token to prevent interactive login prompts on every site
+    $cachedAccessToken = $null
+    $tokenExpiry = (Get-Date).AddYears(-1)
 
     foreach ($url in $siteUrls) {
         $url = $url.Trim()
@@ -160,17 +167,29 @@ try {
                 }
 
                 try {
-                    Write-Host "`n[AUTH] Starting Interactive Login..." -ForegroundColor Yellow
+                    # If we don't have a token or it's expired, do an interactive login
+                    if ([string]::IsNullOrWhiteSpace($cachedAccessToken) -or (Get-Date) -gt $tokenExpiry) {
+                        Write-Host "`n[AUTH] Starting Interactive Login (Token will be cached)..." -ForegroundColor Yellow
 
-                    # For fully automated setups, consider using:
-                    # Connect-PnPOnline -Url $url -ClientId $clientId -Thumbprint $certThumbprint -Tenant $tenantId
-                    $siteConnection = Connect-PnPOnline -Url $url -Interactive -ClientId $clientId -ReturnConnection -ErrorAction Stop
-                    Write-Host " Connected (Interactive)" -ForegroundColor Green
+                        $siteConnection = Connect-PnPOnline -Url $url -Interactive -ClientId $clientId -ReturnConnection -ErrorAction Stop
+                        Write-Host " Connected (Interactive)" -ForegroundColor Green
+
+                        # Extract the token so we can reuse it for the next 45 minutes
+                        try {
+                            $cachedAccessToken = Get-PnPAccessToken -Connection $siteConnection -ErrorAction Stop
+                            $tokenExpiry = (Get-Date).AddMinutes(45) # Typical Azure AD token lifetime is ~60m, refreshing at 45m is safe
+                        } catch {
+                            Write-Warning "Could not cache Access Token. You may be prompted to log in again for the next site."
+                        }
+                    } else {
+                        Write-Host " Connected (Using Cached Token)" -ForegroundColor Green
+                        $secureToken = ConvertTo-SecureString $cachedAccessToken -AsPlainText -Force
+                        $siteConnection = Connect-PnPOnline -Url $url -AccessToken $secureToken -ReturnConnection -ErrorAction Stop
+                    }
                 }
                 catch {
                     Write-Error "`nFAILED: $($_.Exception.Message)"
-                    Write-Warning "Authentication Failed using 'Interactive' Login."
-                    Write-Warning "If this fails, please switch to Windows PowerShell 5.1."
+                    Write-Warning "Authentication Failed."
                     throw $_
                 }
             }
@@ -206,7 +225,9 @@ try {
                 Write-Host "Fetching S3 Object List for Cache..." -NoNewline
 
                 # Fetch ALL objects for this site-folder prefix to minimize API calls
-                $s3Objects = Get-S3Object -BucketName $S3BucketName -KeyPrefix "$siteFolderName/" -ErrorAction Stop
+                $cacheParams = $awsGlobalParams.Clone()
+                $cacheParams.KeyPrefix = "$siteFolderName/"
+                $s3Objects = Get-S3Object @cacheParams
 
                 foreach ($obj in $s3Objects) {
                     $s3Cache[$obj.Key] = $obj
@@ -402,7 +423,10 @@ try {
                         # Check if Exists
                         if (-not $s3Cache.ContainsKey($s3Key)) {
                             try {
-                                $directObj = Get-S3Object -BucketName $S3BucketName -KeyPrefix $s3Key -ErrorAction SilentlyContinue | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
+                                $directParams = $awsGlobalParams.Clone()
+                                $directParams.KeyPrefix = $s3Key
+                                $directParams.ErrorAction = 'SilentlyContinue'
+                                $directObj = Get-S3Object @directParams | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
                                 if ($directObj) { $s3Cache[$s3Key] = $directObj }
                             }
                             catch {}
@@ -413,7 +437,10 @@ try {
                             Write-Host "Creating Folder: $s3Key" -ForegroundColor Yellow
                             try {
                                 $emptyTmp = [System.IO.Path]::GetTempFileName()
-                                Write-S3Object -BucketName $S3BucketName -Key $s3Key -File $emptyTmp -ErrorAction Stop
+                                $folderAwsParams = $awsGlobalParams.Clone()
+                                $folderAwsParams.Key = $s3Key
+                                $folderAwsParams.File = $emptyTmp
+                                Write-S3Object @folderAwsParams
                                 Remove-Item -LiteralPath $emptyTmp -Force
                                 Write-Host " -> Created" -ForegroundColor Green
                                 $counters.Copied++
@@ -494,7 +521,10 @@ try {
                     else {
                         try {
                             # Verify if truly missing
-                            $directObj = Get-S3Object -BucketName $S3BucketName -KeyPrefix $s3Key -ErrorAction SilentlyContinue | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
+                            $directParams = $awsGlobalParams.Clone()
+                            $directParams.KeyPrefix = $s3Key
+                            $directParams.ErrorAction = 'SilentlyContinue'
+                            $directObj = Get-S3Object @directParams | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
                             if ($directObj) {
                                 $s3Obj = $directObj
                                 # Optionally update cache? $s3Cache[$s3Key] = $directObj
@@ -623,7 +653,10 @@ try {
                                     do {
                                         try {
                                             Write-Host "Uploading to S3..." -NoNewline
-                                            Write-S3Object -BucketName $S3BucketName -File $localTempFile -Key $s3Key -ErrorAction Stop
+                                            $fileAwsParams = $awsGlobalParams.Clone()
+                                            $fileAwsParams.Key = $s3Key
+                                            $fileAwsParams.File = $localTempFile
+                                            Write-S3Object @fileAwsParams
                                             Write-Host " -> Done" -ForegroundColor Green
                                             $uploaded = $true
                                             $finalStatus = "Synced ($action)"
@@ -919,7 +952,12 @@ try {
             $url | Out-File -FilePath $ProcessedLogPath -Append -Encoding utf8 -Force
         }
         catch {
-            Write-Warning "Site Process Failed ($url): $_"
+            $errMsg = $_.Exception.Message
+            if ($errMsg -match "unauthorized operation" -or $errMsg -match "403" -or $errMsg -match "401") {
+                Write-Host "Access Denied (Skipped): You do not have permissions to access $url" -ForegroundColor DarkGray
+            } else {
+                Write-Warning "Site Process Failed ($url): $_"
+            }
         }
     }
 
