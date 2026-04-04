@@ -36,6 +36,10 @@ try {
     $AwsSecretKey = $config.AwsSecretKey.Trim()
     $AwsRegion = if ($config.AwsRegion) { $config.AwsRegion.Trim() } else { "ap-southeast-1" }
 
+    $AppId = if ($config.AppId) { $config.AppId.Trim() } else { $null }
+    $TenantId = if ($config.TenantId) { $config.TenantId.Trim() } else { $null }
+    $CertThumbprint = if ($config.CertThumbprint) { $config.CertThumbprint.Trim() } else { $null }
+
     # Load Site List
     $siteUrls = @()
     if ($config.SiteList -and $config.SiteList.Count -gt 0) {
@@ -167,24 +171,15 @@ try {
                 }
 
                 try {
-                    # If we don't have a token or it's expired, do an interactive login
-                    if ([string]::IsNullOrWhiteSpace($cachedAccessToken) -or (Get-Date) -gt $tokenExpiry) {
-                        Write-Host "`n[AUTH] Starting Interactive Login (Token will be cached)..." -ForegroundColor Yellow
-
+                    if ($AppId -and $TenantId -and $CertThumbprint) {
+                        Write-Host " Connected (App-Only Certificate)" -ForegroundColor Green
+                        $siteConnection = Connect-PnPOnline -Url $url -ClientId $AppId -Tenant $TenantId -Thumbprint $CertThumbprint -ReturnConnection -ErrorAction Stop
+                    }
+                    else {
+                        Write-Host "`n[AUTH] Starting Interactive Login (Will prompt per site)..." -ForegroundColor Yellow
+                        Write-Host "TIP: Configure AppId, TenantId, and CertThumbprint in JSON for seamless silent login." -ForegroundColor Cyan
                         $siteConnection = Connect-PnPOnline -Url $url -Interactive -ClientId $clientId -ReturnConnection -ErrorAction Stop
                         Write-Host " Connected (Interactive)" -ForegroundColor Green
-
-                        # Extract the token so we can reuse it for the next 45 minutes
-                        try {
-                            $cachedAccessToken = Get-PnPAccessToken -Connection $siteConnection -ErrorAction Stop
-                            $tokenExpiry = (Get-Date).AddMinutes(45) # Typical Azure AD token lifetime is ~60m, refreshing at 45m is safe
-                        } catch {
-                            Write-Warning "Could not cache Access Token. You may be prompted to log in again for the next site."
-                        }
-                    } else {
-                        Write-Host " Connected (Using Cached Token)" -ForegroundColor Green
-                        $secureToken = ConvertTo-SecureString $cachedAccessToken -AsPlainText -Force
-                        $siteConnection = Connect-PnPOnline -Url $url -AccessToken $secureToken -ReturnConnection -ErrorAction Stop
                     }
                 }
                 catch {
