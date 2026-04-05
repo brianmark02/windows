@@ -24,7 +24,7 @@ param(
 
 if (-not (Test-Path $ConfigFilePath)) {
     Write-Error "Configuration file not found at $ConfigFilePath."
-    exit 1
+    Exit 1
 }
 
 try {
@@ -35,10 +35,6 @@ try {
     $AwsAccessKey = $config.AwsAccessKey.Trim()
     $AwsSecretKey = $config.AwsSecretKey.Trim()
     $AwsRegion = if ($config.AwsRegion) { $config.AwsRegion.Trim() } else { "ap-southeast-1" }
-
-    $AppId = if ($config.AppId) { $config.AppId.Trim() } elseif ($config.ClientId) { $config.ClientId.Trim() } else { $null }
-    $TenantId = if ($config.TenantId) { $config.TenantId.Trim() } elseif ($config.Tenant) { $config.Tenant.Trim() } else { $null }
-    $CertThumbprint = if ($config.CertThumbprint) { $config.CertThumbprint.Trim() } elseif ($config.Thumbprint) { $config.Thumbprint.Trim() } else { $null }
 
     # Load Site List
     $siteUrls = @()
@@ -54,17 +50,17 @@ try {
     }
     else {
         Write-Error "No sites found. Configure 'SiteListPath' or 'SharePointSiteUrl'."
-        exit 1
+        Exit 1
     }
 
     if ([string]::IsNullOrWhiteSpace($S3BucketName)) {
         Write-Error "S3BucketName is required."
-        exit 1
+        Exit 1
     }
 }
 catch {
     Write-Error "Config Load Failed: $_"
-    exit 1
+    Exit 1
 }
 
 # Ensure Temp Path Exists
@@ -72,15 +68,19 @@ if (-not (Test-Path $TempDownloadPath)) {
     New-Item -ItemType Directory -Force -Path $TempDownloadPath | Out-Null
 }
 
+# Initialize Runspace Pool for PS5.1 S3 Uploads
+$RunspacePool = [runspacefactory]::CreateRunspacePool(1, 10)
+$RunspacePool.Open()
+
 # Check Modules
 if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
     Write-Error "PnP.PowerShell module is missing."
-    exit 1
+    Exit 1
 }
 
 if (-not (Get-Module -ListAvailable -Name AWSPowerShell) -and -not (Get-Module -ListAvailable -Name AWS.Tools.S3)) {
     Write-Error "AWS PowerShell module is missing."
-    exit 1
+    Exit 1
 }
 
 # -----------------------------------------------------------------------------
@@ -88,28 +88,20 @@ if (-not (Get-Module -ListAvailable -Name AWSPowerShell) -and -not (Get-Module -
 # -----------------------------------------------------------------------------
 
 try {
-    # Initialize AWS parameters for the main thread explicitly to avoid changing default config
+    # Initialize AWS
     Write-Host "Initializing AWS..." -NoNewline
-    $awsGlobalParams = @{
-        BucketName  = $S3BucketName
-        ErrorAction = 'Stop'
-    }
     if (-not [string]::IsNullOrWhiteSpace($AwsAccessKey)) {
-        $awsGlobalParams.AccessKey = $AwsAccessKey
-        $awsGlobalParams.SecretKey = $AwsSecretKey
-        $awsGlobalParams.Region    = $AwsRegion
+        Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
     }
 
     # Verify S3 Access
     try {
-        $verifyParams = $awsGlobalParams.Clone()
-        $verifyParams.MaxKeys = 1
-        Get-S3Object @verifyParams | Select-Object -First 1 | Out-Null
+        Get-S3Object -BucketName $S3BucketName -MaxKeys 1 -ErrorAction Stop | Select-Object -First 1 | Out-Null
         Write-Host " OK" -ForegroundColor Green
     }
     catch {
         Write-Error "Failed to access S3 Bucket '$S3BucketName'. $_"
-        exit 1
+        Exit 1
     }
 
     $ReportFilePath = ".\SyncReport.csv"
@@ -126,10 +118,6 @@ try {
         }
         Write-Host "Loaded $($processedSites.Count) processed sites." -ForegroundColor Gray
     }
-
-    # Global variables for caching token to prevent interactive login prompts on every site
-    $cachedAccessToken = $null
-    $tokenExpiry = (Get-Date).AddYears(-1)
 
     foreach ($url in $siteUrls) {
         $url = $url.Trim()
@@ -151,11 +139,10 @@ try {
             # Connect SharePoint (Hybrid Support) - Restored for PS 5.1 Compatibility
             Write-Host "Connecting to SharePoint..." -NoNewline
 
-            $siteConnection = $null
             if ($PSVersionTable.PSVersion.Major -lt 7) {
                 # PowerShell 5.1 (Legacy) - Use WebLogin (Bypasses Modern App Blocks)
                 try {
-                    $siteConnection = Connect-PnPOnline -Url $url -UseWebLogin -ReturnConnection -ErrorAction Stop
+                    Connect-PnPOnline -Url $url -UseWebLogin -ErrorAction Stop
                     Write-Host " Connected (WebLogin - Legacy)" -ForegroundColor Green
                 }
                 catch {
@@ -165,31 +152,29 @@ try {
             }
             else {
                 # PowerShell 7+ (Modern)
-                # Default to "SharePoint Online Management Shell" App ID (Public Client)
+                # Default to "Azure PowerShell" App ID (Public Client)
                 if ([string]::IsNullOrWhiteSpace($clientId) -or -not ($clientId -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')) {
-                    $clientId = "9bc3ab49-b65d-410a-85ad-de819febfddc"
+                    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"
                 }
 
                 try {
-                    if ($AppId -and $TenantId -and $CertThumbprint) {
-                        Write-Host " Connected (App-Only Certificate)" -ForegroundColor Green
-                        $siteConnection = Connect-PnPOnline -Url $url -ClientId $AppId -Tenant $TenantId -Thumbprint $CertThumbprint -ReturnConnection -ErrorAction Stop
-                    }
-                    else {
-                        Write-Host "`n[AUTH] Starting Interactive Login (Will prompt per site)..." -ForegroundColor Yellow
-                        Write-Host "TIP: Configure AppId, TenantId, and CertThumbprint in JSON for seamless silent login." -ForegroundColor Cyan
-                        $siteConnection = Connect-PnPOnline -Url $url -Interactive -ClientId $clientId -ReturnConnection -ErrorAction Stop
-                        Write-Host " Connected (Interactive)" -ForegroundColor Green
-                    }
+                    Write-Host "`n[AUTH] Starting Device Login (Azure PowerShell App)..." -ForegroundColor Yellow
+                    Write-Host "[AUTH] Please watch the console for a CODE and URL." -ForegroundColor Yellow
+
+                    # For fully automated setups, consider using:
+                    # Connect-PnPOnline -Url $url -ClientId $clientId -Thumbprint $certThumbprint -Tenant $tenantId
+                    Connect-PnPOnline -Url $url -DeviceLogin -ClientId $clientId -ErrorAction Stop
+                    Write-Host " Connected (DeviceLogin)" -ForegroundColor Green
                 }
                 catch {
                     Write-Error "`nFAILED: $($_.Exception.Message)"
-                    Write-Warning "Authentication Failed."
+                    Write-Warning "Authentication Failed using 'Azure PowerShell' ID."
+                    Write-Warning "If this fails, please switch to Windows PowerShell 5.1."
                     throw $_
                 }
             }
 
-            $web = Get-PnPWeb -Connection $siteConnection
+            $web = Get-PnPWeb
             $siteName = $web.Title
             # Sanitize: Remove invalid chars AND trim dots/spaces from start/end
             $siteFolderName = ($siteName -replace '[\\/:*?"<>|]', '').Trim(' .')
@@ -198,7 +183,7 @@ try {
 
             # Get ALL Document and Page Libraries
             Write-Host "Gathering all valid Document and Page Libraries..." -ForegroundColor Yellow
-            $availableLibs = Get-PnPList -Connection $siteConnection | Where-Object {
+            $availableLibs = Get-PnPList | Where-Object {
                 $_.BaseType -eq 1 -and
                 $_.Hidden -eq $false -and
                 $_.Title -notmatch '(?i)^(AppPackages|Apps for SharePoint|Client Side Assets|MicroFeed|ContentTypeSyncLog)$'
@@ -220,9 +205,7 @@ try {
                 Write-Host "Fetching S3 Object List for Cache..." -NoNewline
 
                 # Fetch ALL objects for this site-folder prefix to minimize API calls
-                $cacheParams = $awsGlobalParams.Clone()
-                $cacheParams.KeyPrefix = "$siteFolderName/"
-                $s3Objects = Get-S3Object @cacheParams
+                $s3Objects = Get-S3Object -BucketName $S3BucketName -KeyPrefix "$siteFolderName/" -ErrorAction Stop
 
                 foreach ($obj in $s3Objects) {
                     $s3Cache[$obj.Key] = $obj
@@ -242,7 +225,7 @@ try {
 
                 # CAML Query: RecursiveAll (Traverse Folders)
                 $camlQuery = "<View Scope='RecursiveAll'><RowLimit Paged='TRUE'>1000</RowLimit></View>"
-                $items = Get-PnPListItem -List $lib -PageSize 1000 -Query $camlQuery -Connection $siteConnection -ErrorAction Stop
+                $items = Get-PnPListItem -List $lib -PageSize 1000 -Query $camlQuery -ErrorAction Stop
 
                 if (-not $items -or $items.Count -eq 0) {
                     Write-Host "No items found in $($lib.Title)." -ForegroundColor DarkGray
@@ -402,7 +385,8 @@ try {
                 # -------------------------
                 # PS 5.1 SEQUENTIAL (Real-time Reporting + Fail-safe S3 Lookup)
                 # -------------------------
-                Write-Host "Analyzing & Syncing (Sequential - PS5.1 - RealTime)..." -ForegroundColor Yellow
+                Write-Host "Analyzing & Syncing (PS5.1 Asynchronous Background S3 Uploads)..." -ForegroundColor Yellow
+                $uploadJobs = @()
 
                 $items | ForEach-Object {
                     $item = $_
@@ -418,10 +402,7 @@ try {
                         # Check if Exists
                         if (-not $s3Cache.ContainsKey($s3Key)) {
                             try {
-                                $directParams = $awsGlobalParams.Clone()
-                                $directParams.KeyPrefix = $s3Key
-                                $directParams.ErrorAction = 'SilentlyContinue'
-                                $directObj = Get-S3Object @directParams | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
+                                $directObj = Get-S3Object -BucketName $S3BucketName -KeyPrefix $s3Key -ErrorAction SilentlyContinue | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
                                 if ($directObj) { $s3Cache[$s3Key] = $directObj }
                             }
                             catch {}
@@ -432,10 +413,7 @@ try {
                             Write-Host "Creating Folder: $s3Key" -ForegroundColor Yellow
                             try {
                                 $emptyTmp = [System.IO.Path]::GetTempFileName()
-                                $folderAwsParams = $awsGlobalParams.Clone()
-                                $folderAwsParams.Key = $s3Key
-                                $folderAwsParams.File = $emptyTmp
-                                Write-S3Object @folderAwsParams
+                                Write-S3Object -BucketName $S3BucketName -Key $s3Key -File $emptyTmp -ErrorAction Stop
                                 Remove-Item -LiteralPath $emptyTmp -Force
                                 Write-Host " -> Created" -ForegroundColor Green
                                 $counters.Copied++
@@ -516,10 +494,7 @@ try {
                     else {
                         try {
                             # Verify if truly missing
-                            $directParams = $awsGlobalParams.Clone()
-                            $directParams.KeyPrefix = $s3Key
-                            $directParams.ErrorAction = 'SilentlyContinue'
-                            $directObj = Get-S3Object @directParams | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
+                            $directObj = Get-S3Object -BucketName $S3BucketName -KeyPrefix $s3Key -ErrorAction SilentlyContinue | Where-Object { $_.Key -eq $s3Key } | Select-Object -First 1
                             if ($directObj) {
                                 $s3Obj = $directObj
                                 # Optionally update cache? $s3Cache[$s3Key] = $directObj
@@ -578,7 +553,7 @@ try {
 
                                         # Attempt 1: Standard PnP (REST)
                                         if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($fileName)) { throw "Filename contains PowerShell wildcard characters which breaks Get-PnPFile parameter binding (fallback to CSOM)" }
-                                        Get-PnPFile -Url $serverRelativeUrl -Path $TempDownloadPath -FileName $safeTempName -AsFile -Force -Connection $siteConnection -ErrorAction Stop
+                                        Get-PnPFile -Url $serverRelativeUrl -Path $TempDownloadPath -FileName $safeTempName -AsFile -Force -ErrorAction Stop
 
                                         Write-Progress -Activity "Downloading from SharePoint" -Completed
                                         $downloaded = $true
@@ -588,7 +563,7 @@ try {
                                         Write-Warning "`n -> Standard download failed ($($_.Exception.Message)). Switching to CSOM..."
                                         try {
                                             # Attempt 2: CSOM Fallback (ID-Based for robustness)
-                                        $ctx = Get-PnPContext -Connection $siteConnection
+                                            $ctx = Get-PnPContext
                                             $list = $ctx.Web.Lists.GetByTitle($lib.Title)
                                             $spItem = $list.GetItemById($item.Id)
                                             $fileObj = $spItem.File
@@ -641,43 +616,65 @@ try {
                                 }
                             } while (-not $downloaded -and $retryCount -lt $maxRetries)
 
+                        $handoffToBackground = $false
                             if ($downloaded) {
-                                try {
+                                # Offload the S3 Upload to a background thread so the loop can instantly download the next file
+                                Write-Host "Queueing S3 Upload in background..." -ForegroundColor Cyan
+
+                                $awsAccess = $AwsAccessKey
+                                $awsSecret = $AwsSecretKey
+                                $awsReg = $AwsRegion
+
+                                $ps = [powershell]::Create().AddScript({
+                                    param($access, $secret, $reg, $bucket, $key, $file, $maxRetries)
+
+                                    # Background threads lose module context sometimes, so explicitly import AWS
+                                    Import-Module AWSPowerShell -ErrorAction SilentlyContinue
+                                    Import-Module AWS.Tools.S3 -ErrorAction SilentlyContinue
+
+                                    if (-not [string]::IsNullOrWhiteSpace($access)) {
+                                        Initialize-AWSDefaultConfiguration -AccessKey $access -SecretKey $secret -Region $reg -ErrorAction SilentlyContinue
+                                    }
+
                                     $uploadRetryCount = 0
                                     $uploaded = $false
                                     do {
                                         try {
-                                            Write-Host "Uploading to S3..." -NoNewline
-                                            $fileAwsParams = $awsGlobalParams.Clone()
-                                            $fileAwsParams.Key = $s3Key
-                                            $fileAwsParams.File = $localTempFile
-                                            Write-S3Object @fileAwsParams
-                                            Write-Host " -> Done" -ForegroundColor Green
+                                            Write-S3Object -BucketName $bucket -Key $key -File $file -ErrorAction Stop
                                             $uploaded = $true
-                                            $finalStatus = "Synced ($action)"
-                                            $counters.Copied++
-
-                                            $s3SizeReport = [math]::Round((Get-Item -LiteralPath $localTempFile).Length / 1MB, 2)
-                                            $s3DateReport = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                                        }
-                                        catch {
+                                        } catch {
                                             $uploadRetryCount++
-                                            if ($uploadRetryCount -lt $maxRetries) {
-                                                Start-Sleep -Seconds 5
-                                            }
-                                            else {
-                                                $finalStatus = "Upload Failed"
-                                                $finalNotes = "UpErr: $($_.Exception.Message)"
-                                                $counters.Errors++
-                                            }
+                                            if ($uploadRetryCount -lt $maxRetries) { Start-Sleep -Seconds 5 }
                                         }
                                     } while (-not $uploaded -and $uploadRetryCount -lt $maxRetries)
+
+                                    if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+
+                                    return @{ Success = $uploaded; File = $file; Error = $_.Exception.Message }
+                                }).AddArgument($awsAccess).AddArgument($awsSecret).AddArgument($awsReg).AddArgument($S3BucketName).AddArgument($s3Key).AddArgument($localTempFile).AddArgument($maxRetries)
+
+                                $ps.RunspacePool = $RunspacePool
+                                $handle = $ps.BeginInvoke()
+
+                                $uploadJobs += [PSCustomObject]@{
+                                    PowerShell = $ps
+                                    Handle = $handle
+                                    FileName = $fileName
                                 }
-                                catch { throw $_ }
+
+                                $handoffToBackground = $true
+
+                                $finalStatus = "Synced ($action)"
+                                $counters.Copied++
+                                $s3SizeReport = [math]::Round($spFileSize / 1MB, 2)
+                                $s3DateReport = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
                             }
                         }
                         finally {
-                            if (Test-Path -LiteralPath $localTempFile) { Remove-Item -LiteralPath $localTempFile -Force }
+                            # ONLY delete the temp file here if the download failed and we NEVER handed it off to the background thread
+                            if (-not $handoffToBackground -and (Test-Path -LiteralPath $localTempFile)) {
+                                Remove-Item -LiteralPath $localTempFile -Force
+                            }
                         }
                     }
 
@@ -696,6 +693,27 @@ try {
                     } | Export-Csv -Path $ReportFilePath -NoTypeInformation -Append -Force
                 }
 
+                # Wait for all background PS5.1 uploads to finish for this site
+                if ($uploadJobs.Count -gt 0) {
+                    Write-Host "Waiting for $($uploadJobs.Count) background S3 uploads to finish..." -ForegroundColor Yellow
+                    foreach ($job in $uploadJobs) {
+                        try {
+                            $result = $job.PowerShell.EndInvoke($job.Handle)
+                            if ($result.Success) {
+                                Write-Host " -> Uploaded: $($job.FileName)" -ForegroundColor Green
+                            } else {
+                                Write-Warning " -> Upload Failed for $($job.FileName): $($result.Error)"
+                                $counters.Errors++
+                            }
+                        } catch {
+                            Write-Warning " -> Upload Failed for $($job.FileName): $_"
+                            $counters.Errors++
+                        } finally {
+                            $job.PowerShell.Dispose()
+                        }
+                    }
+                }
+
                 # IMPORTANT: Nullify $syncPlans to prevent Phase 3 batch processing logic from running again
                 $syncPlans = $null
             }
@@ -712,15 +730,7 @@ try {
 
                 # Capture variables for use in the parallel scope
                 $currentLibTitle = $lib.Title
-
-                # Extract access token securely from the main thread so we can inject it into runspaces
-                $accessToken = $null
-                try {
-                    # Get-PnPAccessToken is the standard supported cmdlet in modern PnP versions
-                    $accessToken = Get-PnPAccessToken -Connection $siteConnection -ErrorAction Stop
-                } catch {
-                    Write-Warning "Failed to retrieve Access Token. Parallel thread connections may fail."
-                }
+                $primaryConnection = Get-PnPConnection
 
                 $syncedResults = $filesToSync | ForEach-Object -Parallel {
                     $plan = $_
@@ -736,34 +746,21 @@ try {
                     $AwsAccessKey = $using:AwsAccessKey
                     $AwsSecretKey = $using:AwsSecretKey
                     $AwsRegion = $using:AwsRegion
-                    $accessToken = $using:accessToken
+                    $primaryConnection = $using:primaryConnection
 
-                    # Force module load inside the runspace
-                    Import-Module PnP.PowerShell -ErrorAction SilentlyContinue
-
-                    # Setup AWS parameters explicitly (bypasses runspace default config issues)
-                    $awsParams = @{
-                        BucketName  = $S3BucketName
-                        ErrorAction = 'Stop'
-                    }
+                    # Setup AWS and PnP contexts inside the parallel runspace
                     if (-not [string]::IsNullOrWhiteSpace($AwsAccessKey)) {
-                        $awsParams.AccessKey = $AwsAccessKey
-                        $awsParams.SecretKey = $AwsSecretKey
-                        $awsParams.Region    = $AwsRegion
+                        Initialize-AWSDefaultConfiguration -AccessKey $AwsAccessKey -SecretKey $AwsSecretKey -Region $AwsRegion
                     }
 
-                    # Reconnect locally within the thread using the captured Bearer token
-                    # This ensures 100% thread safety without needing the missing Clone-PnPConnection cmdlet
+                    # Clone the PnP connection to ensure thread safety without prompting for login
                     $threadConnection = $null
-                    if (-not [string]::IsNullOrWhiteSpace($accessToken)) {
+                    if ($null -ne $primaryConnection) {
                         try {
-                            $secureToken = ConvertTo-SecureString $accessToken -AsPlainText -Force
-                            $threadConnection = Connect-PnPOnline -Url $url -ReturnConnection -ErrorAction Stop -WarningAction SilentlyContinue -AccessToken $secureToken
+                            $threadConnection = Clone-PnPConnection -Connection $primaryConnection
                         } catch {
-                            Write-Warning "Failed to setup thread connection: $($_.Exception.Message)"
+                            Write-Warning "Failed to clone PnP Connection in thread: $($_.Exception.Message)"
                         }
-                    } else {
-                        Write-Warning "No Access Token found. Downloading in parallel may fail with Unauthorized."
                     }
 
                     # --- FOLDER LOGIC ---
@@ -771,11 +768,7 @@ try {
                         try {
                             Write-Host "Creating Folder: $s3Key" -NoNewline
                             $emptyTmp = [System.IO.Path]::GetTempFileName()
-
-                            $folderAwsParams = $awsParams.Clone()
-                            $folderAwsParams.Key = $s3Key
-                            $folderAwsParams.File = $emptyTmp
-                            Write-S3Object @folderAwsParams
+                            Write-S3Object -BucketName $S3BucketName -Key $s3Key -File $emptyTmp -ErrorAction Stop
                             Remove-Item -LiteralPath $emptyTmp -Force
                             Write-Host " -> Created" -ForegroundColor Green
                             $plan.Status = "Created"
@@ -875,10 +868,7 @@ try {
                                 do {
                                     try {
                                         Write-Host "Uploading to S3 (Attempt $($uploadRetryCount + 1))..." -NoNewline
-                                        $fileAwsParams = $awsParams.Clone()
-                                        $fileAwsParams.Key = $s3Key
-                                        $fileAwsParams.File = $localTempFile
-                                        Write-S3Object @fileAwsParams
+                                        Write-S3Object -BucketName $S3BucketName -File $localTempFile -Key $s3Key -ErrorAction Stop
                                         Write-Host " -> Done" -ForegroundColor Green
                                         $uploaded = $true
                                         $finalStatus = "Synced ($action)"
@@ -947,18 +937,17 @@ try {
             $url | Out-File -FilePath $ProcessedLogPath -Append -Encoding utf8 -Force
         }
         catch {
-            $errMsg = $_.Exception.Message
-            if ($errMsg -match "unauthorized operation" -or $errMsg -match "403" -or $errMsg -match "401") {
-                Write-Host "Access Denied (Skipped): You do not have permissions to access $url" -ForegroundColor DarkGray
-            } else {
-                Write-Warning "Site Process Failed ($url): $_"
-            }
+            Write-Warning "Site Process Failed ($url): $_"
         }
     }
 
     # EXPORT REPORT
     Write-Host "`nConsolidated Sync Report saved to: $ReportFilePath" -ForegroundColor Cyan
 
+    if ($null -ne $RunspacePool) {
+        $RunspacePool.Close()
+        $RunspacePool.Dispose()
+    }
 }
 catch {
     Write-Error "Script Failed: $_"
