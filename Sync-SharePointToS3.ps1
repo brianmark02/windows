@@ -937,7 +937,12 @@ try {
             $url | Out-File -FilePath $ProcessedLogPath -Append -Encoding utf8 -Force
         }
         catch {
-            Write-Warning "Site Process Failed ($url): $_"
+            $errMsg = $_.Exception.Message
+            if ($errMsg -match "(?i)unauthorized" -or $errMsg -match "403" -or $errMsg -match "401") {
+                Write-Host "Access Denied (Skipped): You do not have permissions to access $url" -ForegroundColor DarkGray
+            } else {
+                Write-Warning "Site Process Failed ($url): $_"
+            }
         }
     }
 
